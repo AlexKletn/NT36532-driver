@@ -1,0 +1,14 @@
+[package]
+name = "adapter-KTZ8866"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "KTZ8866 adapter for panel backlight and power interfaces"
+
+[lib]
+name = "adapter_ktz8866"
+
+[dependencies]
+panel-backlight = { path = "../panel-backlight" }
+panel-power = { path = "../panel-power" }
+# ktz8866-driver = { git = "https://github.com/AlexKletn/KTZ8866-driver.git", rev = "<commit-with-library-crate>" }
