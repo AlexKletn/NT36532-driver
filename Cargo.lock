@@ -6,9 +6,15 @@ version = 4
 name = "adapter-KTZ8866"
 version = "0.1.0"
 dependencies = [
+ "ktz8866-driver",
  "panel-backlight",
  "panel-power",
 ]
+
+[[package]]
+name = "ktz8866-driver"
+version = "0.1.0"
+source = "git+https://github.com/AlexKletn/KTZ8866-driver.git?rev=425302d8ff3ad74c8bf0516cebf8ab364d423a29#425302d8ff3ad74c8bf0516cebf8ab364d423a29"
 
 [[package]]
 name = "panel-backlight"
@@ -17,10 +23,17 @@ version = "0.1.0"
 [[package]]
 name = "panel-domain"
 version = "0.1.0"
+dependencies = [
+ "panel-backlight",
+ "panel-power",
+]
 
 [[package]]
 name = "panel-nt36532"
 version = "0.1.0"
+dependencies = [
+ "panel-domain",
+]
 
 [[package]]
 name = "panel-power"

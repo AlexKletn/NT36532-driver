@@ -3,3 +3,7 @@ name = "panel-domain"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+panel-backlight = { path = "../panel-backlight" }
+panel-power = { path = "../panel-power" }

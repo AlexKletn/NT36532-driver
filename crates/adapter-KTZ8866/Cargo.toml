@@ -11,4 +11,4 @@ name = "adapter_ktz8866"
 [dependencies]
 panel-backlight = { path = "../panel-backlight" }
 panel-power = { path = "../panel-power" }
-# ktz8866-driver = { git = "https://github.com/AlexKletn/KTZ8866-driver.git", rev = "<commit-with-library-crate>" }
+ktz8866-driver = { git = "https://github.com/AlexKletn/KTZ8866-driver.git", rev = "425302d8ff3ad74c8bf0516cebf8ab364d423a29" }

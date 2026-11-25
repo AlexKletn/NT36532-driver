@@ -1,1 +1,55 @@
-# Register the module once the Rust entry point and DSI shim are implemented.
+# SPDX-License-Identifier: GPL-2.0-only
+
+obj-m := nt36532.o
+RUSTFLAGS_REMOVE_module.o := --edition=2021
+RUSTFLAGS_module.o := --edition=2024
+nt36532-y := module.o firmware_shim.o input_shim.o spi_shim.o touch_driver_shim.o \
+	touch_irq_shim.o touch_panel_shim.o dsi_shim.o panel_links_shim.o drm_panel_shim.o
+
+touch-profile-generator := $(src)/../crates/panel-touch/profile/generate_profile.py
+export OUT_DIR := $(abspath $(obj))
+
+define filechk_touch_profiles
+	$(if $(strip $(TOUCH_PROFILES_DIR)), \
+		python3 "$(touch-profile-generator)" "$(abspath $(TOUCH_PROFILES_DIR))" /dev/stdout, \
+		printf '%s\n' 'pub static TOUCH_PROFILES: &[FirmwareProfile] = &[];')
+endef
+
+$(obj)/profile.rs: $(touch-profile-generator) FORCE
+	$(call filechk,touch_profiles)
+
+$(obj)/module.o: $(obj)/profile.rs
+targets += profile.rs
+
+display-profile-generator := $(src)/../crates/panel-nt36532/profile/generate_profile.py
+
+define filechk_display_profile
+	$(if $(strip $(PANEL_PROFILE)), \
+		python3 "$(display-profile-generator)" "$(abspath $(PANEL_PROFILE))" /dev/stdout, \
+		printf '%s\n' 'pub static SELECTED_PROFILE: Option<SelectedProfile> = None;')
+endef
+
+$(obj)/display_profile.rs: $(display-profile-generator) FORCE
+	$(call filechk,display_profile)
+
+$(obj)/module.o: $(obj)/display_profile.rs
+targets += display_profile.rs
+
+ifneq ($(strip $(KTZ8866_SRC)),)
+nt36532-y += ktz_i2c_shim.o panel_driver_shim.o
+RUSTFLAGS_module.o += --cfg nt36532_ktz8866
+
+define filechk_ktz_source
+	python3 "$(src)/generate_ktz_source.py" "$(abspath $(KTZ8866_SRC))"
+endef
+
+$(obj)/ktz_source.rs: $(src)/generate_ktz_source.py FORCE
+	$(call filechk,ktz_source)
+
+$(obj)/module.o: $(obj)/ktz_source.rs
+targets += ktz_source.rs
+endif
+
+ifneq ($(shell grep -l '[(][*]set_live_refresh[)]' "$(srctree)/include/drm/drm_panel.h" 2>/dev/null),)
+CFLAGS_drm_panel_shim.o += -DNT36532_HAS_DRM_LIVE_REFRESH
+endif

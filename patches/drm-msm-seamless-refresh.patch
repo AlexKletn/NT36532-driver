@@ -1,0 +1,1047 @@
+diff --git a/drivers/gpu/drm/msm/Kconfig b/drivers/gpu/drm/msm/Kconfig
+index ed1c477..03b7804 100644
+--- a/drivers/gpu/drm/msm/Kconfig
++++ b/drivers/gpu/drm/msm/Kconfig
+@@ -72,9 +72,23 @@ config DRM_MSM_KMS
+ 	select DRM_PANEL_BRIDGE
+ 
+ config DRM_MSM_KMS_FBDEV
+-	def_bool DRM_FBDEV_EMULATION
++	bool "Emulate framebuffer device for MSM"
++	default DRM_FBDEV_EMULATION
+ 	depends on DRM_MSM_KMS
+ 	select FB_SYSMEM_HELPERS
++	help
++	  Provides a text console on the panel after MSM takes over from
++	  simpledrm.
++
++	  Disable this on the TB371FC. The panel uses DSC, and the fbdev
++	  mode differs from the compositor mode. This can split the image
++	  into three columns and only partially light the backlight until
++	  the desktop starts. Disabling emulation keeps fbdev from
++	  bringing up the panel for the console.
++
++	  The previous hidden def_bool symbol could not be disabled through
++	  .config because olddefconfig restored its value. This option
++	  makes the setting configurable.
+ 
+ config DRM_MSM_MDSS
+ 	bool
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index 42d0a52..6601a32 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -1018,6 +1018,8 @@ static void dpu_crtc_destroy_state(struct drm_crtc *crtc,
+ static int _dpu_crtc_wait_for_frame_done(struct drm_crtc *crtc)
+ {
+ 	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
++	unsigned int timeout_ms = DPU_CRTC_FRAME_DONE_TIMEOUT_MS;
++	int fps = drm_mode_vrefresh(&crtc->state->adjusted_mode);
+ 	int ret, rc = 0;
+ 
+ 	if (!atomic_read(&dpu_crtc->frame_pending)) {
+@@ -1025,9 +1027,12 @@ static int _dpu_crtc_wait_for_frame_done(struct drm_crtc *crtc)
+ 		return 0;
+ 	}
+ 
++	if (fps > 0)
++		timeout_ms = max_t(unsigned int, timeout_ms, DIV_ROUND_UP(2000, fps));
++
+ 	DPU_ATRACE_BEGIN("frame done completion wait");
+ 	ret = wait_for_completion_timeout(&dpu_crtc->frame_done_comp,
+-			msecs_to_jiffies(DPU_CRTC_FRAME_DONE_TIMEOUT_MS));
++			msecs_to_jiffies(timeout_ms));
+ 	if (!ret) {
+ 		DRM_ERROR("frame done wait timed out, ret:%d\n", ret);
+ 		rc = -ETIMEDOUT;
+@@ -1609,7 +1614,9 @@ static enum drm_mode_status dpu_crtc_mode_valid(struct drm_crtc *crtc,
+ 	    mode->hdisplay > dpu_kms->catalog->caps->max_mixer_width)
+ 		return MODE_BAD_HVALUE;
+ 
+-	adjusted_mode_clk = dpu_core_perf_adjusted_mode_clk(mode->clock,
++	adjusted_mode_clk = (u64)mode->vtotal * mode->hdisplay *
++			    drm_mode_vrefresh(mode);
++	adjusted_mode_clk = dpu_core_perf_adjusted_mode_clk(adjusted_mode_clk,
+ 							    dpu_kms->perf.perf_cfg);
+ 
+ 	if (dpu_kms->catalog->caps->has_3d_merge)
+@@ -1619,7 +1626,7 @@ static enum drm_mode_status dpu_crtc_mode_valid(struct drm_crtc *crtc,
+ 	 * The given mode, adjusted for the perf clock factor, should not exceed
+ 	 * the max core clock rate
+ 	 */
+-	if (dpu_kms->perf.max_core_clk_rate < adjusted_mode_clk * 1000)
++	if (dpu_kms->perf.max_core_clk_rate < adjusted_mode_clk)
+ 		return MODE_CLOCK_HIGH;
+ 
+ 	/*
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index 0a6be69..8847fff 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -219,6 +219,34 @@ struct dpu_encoder_virt {
+ 
+ #define to_dpu_encoder_virt(x) container_of(x, struct dpu_encoder_virt, base)
+ 
++bool dpu_encoder_stage_live_timing(struct drm_encoder *encoder,
++				   const struct drm_display_mode *mode)
++{
++	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
++	unsigned int i;
++
++	if (!enc->cur_master || !enc->num_phys_encs)
++		return false;
++
++	for (i = 0; i < enc->num_phys_encs; i++)
++		if (!dpu_encoder_phys_vid_can_update_timing(enc->phys_encs[i]))
++			return false;
++
++	for (i = 0; i < enc->num_phys_encs; i++)
++		dpu_encoder_phys_vid_update_timing(enc->phys_encs[i], mode);
++
++	return true;
++}
++
++void dpu_encoder_flush_live_timing(struct drm_encoder *encoder)
++{
++	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
++	unsigned int i;
++
++	for (i = 0; i < enc->num_phys_encs; i++)
++		dpu_encoder_phys_vid_flush_timing(enc->phys_encs[i]);
++}
++
+ static u32 dither_matrix[DITHER_MATRIX_SZ] = {
+ 	15, 7, 13, 5, 3, 11, 1, 9, 12, 4, 14, 6, 0, 8, 2, 10
+ };
+@@ -399,6 +427,13 @@ static void _dpu_encoder_setup_dither(struct dpu_hw_pingpong *hw_pp, unsigned bp
+ 		dither_cfg.c3_bitdepth = 6;
+ 		dither_cfg.temporal_en = 0;
+ 		break;
++	case 8:
++		dither_cfg.c0_bitdepth = 8;
++		dither_cfg.c1_bitdepth = 8;
++		dither_cfg.c2_bitdepth = 8;
++		dither_cfg.c3_bitdepth = 8;
++		dither_cfg.temporal_en = 0;
++		break;
+ 	default:
+ 		hw_pp->ops.setup_dither(hw_pp, NULL);
+ 		return;
+@@ -1301,6 +1336,11 @@ static void _dpu_encoder_virt_enable_helper(struct drm_encoder *drm_enc)
+ 	if (dpu_enc->disp_info.intf_type == INTF_DSI &&
+ 			!WARN_ON(dpu_enc->num_phys_encs == 0)) {
+ 		unsigned bpc = dpu_enc->connector->display_info.bpc;
++
++		if (!bpc)
++			DPU_DEBUG_ENC(dpu_enc,
++				      "connector declares no bpc, dither stays off\n");
++
+ 		for (i = 0; i < MAX_CHANNELS_PER_ENC; i++) {
+ 			if (!dpu_enc->hw_pp[i])
+ 				continue;
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+index 4942097..53b905d 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+@@ -47,6 +47,9 @@ void dpu_encoder_toggle_vblank_for_crtc(struct drm_encoder *encoder,
+ void dpu_encoder_prepare_for_kickoff(struct drm_encoder *encoder);
+ 
+ void dpu_encoder_trigger_kickoff_pending(struct drm_encoder *encoder);
++bool dpu_encoder_stage_live_timing(struct drm_encoder *encoder,
++				   const struct drm_display_mode *mode);
++void dpu_encoder_flush_live_timing(struct drm_encoder *encoder);
+ 
+ void dpu_encoder_kickoff(struct drm_encoder *encoder);
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h
+index 61b22d9..6f1d7a3 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h
+@@ -281,6 +281,10 @@ struct dpu_encoder_wait_info {
+ 
+ struct dpu_encoder_phys *dpu_encoder_phys_vid_init(struct drm_device *dev,
+ 		struct dpu_enc_phys_init_params *p);
++bool dpu_encoder_phys_vid_can_update_timing(struct dpu_encoder_phys *phys_enc);
++void dpu_encoder_phys_vid_update_timing(struct dpu_encoder_phys *phys_enc,
++					const struct drm_display_mode *mode);
++void dpu_encoder_phys_vid_flush_timing(struct dpu_encoder_phys *phys_enc);
+ 
+ struct dpu_encoder_phys *dpu_encoder_phys_cmd_init(struct drm_device *dev,
+ 		struct dpu_enc_phys_init_params *p);
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+index 2ac517d..44aa8f5 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+@@ -254,18 +254,32 @@ static void programmable_fetch_config(struct dpu_encoder_phys *phys_enc,
+ 	spin_unlock_irqrestore(phys_enc->enc_spinlock, lock_flags);
+ }
+ 
++static void dpu_encoder_phys_vid_mode_to_timing(
++		struct dpu_encoder_phys *phys_enc, const struct drm_display_mode *source,
++		u32 fourcc, struct dpu_hw_intf_timing_params *timing)
++{
++	struct drm_display_mode mode;
++
++	drm_mode_init(&mode, source);
++	if (phys_enc->split_role != ENC_ROLE_SOLO || fourcc == DRM_FORMAT_YUV420) {
++		mode.hdisplay >>= 1;
++		mode.htotal >>= 1;
++		mode.hsync_start >>= 1;
++		mode.hsync_end >>= 1;
++		mode.hskew >>= 1;
++	}
++	drm_mode_to_intf_timing_params(phys_enc, &mode, timing);
++}
++
+ static void dpu_encoder_phys_vid_setup_timing_engine(
+ 		struct dpu_encoder_phys *phys_enc)
+ {
+-	struct drm_display_mode mode;
+ 	struct dpu_hw_intf_timing_params timing_params = { 0 };
+ 	const struct msm_format *fmt = NULL;
+ 	u32 fmt_fourcc;
+ 	unsigned long lock_flags;
+ 	struct dpu_hw_intf_cfg intf_cfg = { 0 };
+ 
+-	drm_mode_init(&mode, &phys_enc->cached_mode);
+-
+ 	if (!phys_enc->hw_ctl->ops.setup_intf_cfg) {
+ 		DPU_ERROR("invalid encoder %d\n", phys_enc != NULL);
+ 		return;
+@@ -277,26 +291,12 @@ static void dpu_encoder_phys_vid_setup_timing_engine(
+ 	}
+ 
+ 	DPU_DEBUG_VIDENC(phys_enc, "enabling mode:\n");
+-	drm_mode_debug_printmodeline(&mode);
++	drm_mode_debug_printmodeline(&phys_enc->cached_mode);
+ 
+ 	fmt_fourcc = dpu_encoder_get_drm_fmt(phys_enc);
+ 
+-	if (phys_enc->split_role != ENC_ROLE_SOLO || fmt_fourcc == DRM_FORMAT_YUV420) {
+-		mode.hdisplay >>= 1;
+-		mode.htotal >>= 1;
+-		mode.hsync_start >>= 1;
+-		mode.hsync_end >>= 1;
+-		mode.hskew >>= 1;
+-
+-		DPU_DEBUG_VIDENC(phys_enc,
+-			"split_role %d, halve horizontal %d %d %d %d %d\n",
+-			phys_enc->split_role,
+-			mode.hdisplay, mode.htotal,
+-			mode.hsync_start, mode.hsync_end,
+-			mode.hskew);
+-	}
+-
+-	drm_mode_to_intf_timing_params(phys_enc, &mode, &timing_params);
++	dpu_encoder_phys_vid_mode_to_timing(phys_enc, &phys_enc->cached_mode,
++					     fmt_fourcc, &timing_params);
+ 
+ 	fmt = mdp_get_format(&phys_enc->dpu_kms->base, fmt_fourcc, 0);
+ 	DPU_DEBUG_VIDENC(phys_enc, "fmt_fourcc 0x%X\n", fmt_fourcc);
+@@ -332,6 +332,34 @@ static void dpu_encoder_phys_vid_setup_timing_engine(
+ 	programmable_fetch_config(phys_enc, &timing_params);
+ }
+ 
++bool dpu_encoder_phys_vid_can_update_timing(struct dpu_encoder_phys *phys_enc)
++{
++	return phys_enc && phys_enc->intf_mode == INTF_MODE_VIDEO &&
++		phys_enc->enable_state == DPU_ENC_ENABLED &&
++		phys_enc->hw_intf && phys_enc->hw_ctl &&
++		phys_enc->hw_intf->cap->type == INTF_DSI &&
++		phys_enc->hw_intf->ops.setup_timing_gen &&
++		phys_enc->hw_ctl->ops.update_pending_flush_intf;
++}
++
++void dpu_encoder_phys_vid_update_timing(struct dpu_encoder_phys *phys_enc,
++					const struct drm_display_mode *mode)
++{
++	struct dpu_hw_intf_timing_params timing = { 0 };
++	const struct msm_format *format;
++	unsigned long flags;
++	u32 fourcc = dpu_encoder_get_drm_fmt(phys_enc);
++
++	dpu_encoder_phys_vid_mode_to_timing(phys_enc, mode, fourcc, &timing);
++	timing.live_update = true;
++	format = mdp_get_format(&phys_enc->dpu_kms->base, fourcc, 0);
++	spin_lock_irqsave(phys_enc->enc_spinlock, flags);
++	phys_enc->hw_intf->ops.setup_timing_gen(phys_enc->hw_intf, &timing, format);
++	drm_mode_copy(&phys_enc->cached_mode, mode);
++	spin_unlock_irqrestore(phys_enc->enc_spinlock, flags);
++	programmable_fetch_config(phys_enc, &timing);
++}
++
+ static void dpu_encoder_phys_vid_vblank_irq(void *arg)
+ {
+ 	struct dpu_encoder_phys *phys_enc = arg;
+@@ -383,6 +411,17 @@ static bool dpu_encoder_phys_vid_needs_single_flush(
+ 		phys_enc->split_role != ENC_ROLE_SOLO;
+ }
+ 
++void dpu_encoder_phys_vid_flush_timing(struct dpu_encoder_phys *phys_enc)
++{
++	struct dpu_hw_ctl *ctl = phys_enc->hw_ctl;
++
++	if (dpu_encoder_phys_vid_needs_single_flush(phys_enc) &&
++	    !dpu_encoder_phys_vid_is_master(phys_enc))
++		return;
++
++	ctl->ops.update_pending_flush_intf(ctl, phys_enc->hw_intf->idx);
++}
++
+ static void dpu_encoder_phys_vid_atomic_mode_set(
+ 		struct dpu_encoder_phys *phys_enc,
+ 		struct drm_crtc_state *crtc_state,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+index ac82b69..9f2251e 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+@@ -250,6 +250,8 @@ static void dpu_hw_intf_setup_timing_engine(struct dpu_hw_intf *intf,
+ 	DPU_REG_WRITE(c, INTF_ACTIVE_HCTL,  active_hctl);
+ 	DPU_REG_WRITE(c, INTF_ACTIVE_V_START_F0, active_v_start);
+ 	DPU_REG_WRITE(c, INTF_ACTIVE_V_END_F0, active_v_end);
++	if (p->live_update)
++		return;
+ 	DPU_REG_WRITE(c, INTF_BORDER_COLOR, p->border_clr);
+ 	DPU_REG_WRITE(c, INTF_UNDERFLOW_COLOR, p->underflow_clr);
+ 	DPU_REG_WRITE(c, INTF_HSYNC_SKEW, p->hsync_skew);
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h
+index badd263..c0cea9d 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h
+@@ -35,6 +35,7 @@ struct dpu_hw_intf_timing_params {
+ 
+ 	bool wide_bus_en;
+ 	bool compression_en;
++	bool live_update;
+ 	u32 dce_bytes_per_line;
+ };
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_pingpong.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_pingpong.c
+index 138071b..078d530 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_pingpong.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_pingpong.c
+@@ -41,7 +41,7 @@
+ #define DITHER_DEPTH_MAP_INDEX 9
+ 
+ static u32 dither_depth_map[DITHER_DEPTH_MAP_INDEX] = {
+-	0, 0, 0, 0, 0, 0, 0, 1, 2
++	0, 0, 0, 0, 0, 0, 0, 1, 3
+ };
+ 
+ static void dpu_hw_pp_setup_dither(struct dpu_hw_pingpong *pp,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+index da3556e..0b24c15 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+@@ -1075,6 +1075,8 @@ static const struct msm_kms_funcs kms_funcs = {
+ 	.enable_commit   = dpu_kms_enable_commit,
+ 	.disable_commit  = dpu_kms_disable_commit,
+ 	.check_mode_changed = dpu_kms_check_mode_changed,
++	.stage_live_timing = dpu_encoder_stage_live_timing,
++	.flush_live_timing = dpu_encoder_flush_live_timing,
+ 	.flush_commit    = dpu_kms_flush_commit,
+ 	.wait_flush      = dpu_kms_wait_flush,
+ 	.complete_commit = dpu_kms_complete_commit,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+index 7b92082..1bd0e28 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+@@ -16,10 +16,12 @@
+ #include <drm/drm_damage_helper.h>
+ #include <drm/drm_framebuffer.h>
+ #include <drm/drm_gem_atomic_helper.h>
++#include <drm/drm_panic.h>
+ 
+ #include <linux/soc/qcom/ubwc.h>
+ 
+ #include "msm_drv.h"
++#include "msm_gem.h"
+ #include "dpu_kms.h"
+ #include "dpu_hw_sspp.h"
+ #include "dpu_hw_util.h"
+@@ -1803,11 +1805,39 @@ static const struct drm_plane_funcs dpu_plane_funcs = {
+ 		.format_mod_supported = dpu_plane_format_mod_supported,
+ };
+ 
++static int dpu_plane_get_scanout_buffer(struct drm_plane *plane,
++					struct drm_scanout_buffer *sb)
++{
++	struct drm_framebuffer *fb = plane->state ? plane->state->fb : NULL;
++	struct drm_gem_object *bo;
++	struct msm_gem_object *msm_obj;
++
++	if (!fb)
++		return -ENODEV;
++
++	bo = msm_framebuffer_bo(fb, 0);
++	if (!bo)
++		return -ENODEV;
++
++	msm_obj = to_msm_bo(bo);
++	if (!msm_obj->pages)
++		return -ENODEV;
++
++	sb->format = fb->format;
++	sb->width = fb->width;
++	sb->height = fb->height;
++	sb->pitch[0] = fb->pitches[0];
++	sb->pages = msm_obj->pages;
++
++	return 0;
++}
++
+ static const struct drm_plane_helper_funcs dpu_plane_helper_funcs = {
+ 		.prepare_fb = dpu_plane_prepare_fb,
+ 		.cleanup_fb = dpu_plane_cleanup_fb,
+ 		.atomic_check = dpu_plane_atomic_check,
+ 		.atomic_update = dpu_plane_atomic_update,
++		.get_scanout_buffer = dpu_plane_get_scanout_buffer,
+ };
+ 
+ static const struct drm_plane_helper_funcs dpu_plane_virtual_helper_funcs = {
+@@ -1815,6 +1845,7 @@ static const struct drm_plane_helper_funcs dpu_plane_virtual_helper_funcs = {
+ 	.cleanup_fb = dpu_plane_cleanup_fb,
+ 	.atomic_check = dpu_plane_atomic_check,
+ 	.atomic_update = dpu_plane_atomic_update,
++	.get_scanout_buffer = dpu_plane_get_scanout_buffer,
+ };
+ 
+ /* initialize plane */
+diff --git a/drivers/gpu/drm/msm/dsi/dsi.h b/drivers/gpu/drm/msm/dsi/dsi.h
+index 93c028a..0b59e44 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi.h
++++ b/drivers/gpu/drm/msm/dsi/dsi.h
+@@ -59,7 +59,7 @@ void msm_dsi_manager_tpg_enable(void);
+ /* dsi host */
+ struct msm_dsi_host;
+ int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
+-					const struct mipi_dsi_msg *msg);
++				const struct mipi_dsi_msg *msg);
+ void msm_dsi_host_xfer_restore(struct mipi_dsi_host *host,
+ 					const struct mipi_dsi_msg *msg);
+ int msm_dsi_host_cmd_tx(struct mipi_dsi_host *host,
+@@ -78,6 +78,10 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
+ int msm_dsi_host_power_off(struct mipi_dsi_host *host);
+ int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
+ 				  const struct drm_display_mode *mode);
++bool msm_dsi_host_live_total(struct mipi_dsi_host *host,
++			    const struct drm_display_mode *mode, u32 *total);
++void msm_dsi_host_apply_live_total(struct mipi_dsi_host *host,
++				  const struct drm_display_mode *mode, u32 total);
+ enum drm_mode_status msm_dsi_host_check_dsc(struct mipi_dsi_host *host,
+ 					    const struct drm_display_mode *mode);
+ unsigned long msm_dsi_host_get_mode_flags(struct mipi_dsi_host *host);
+@@ -122,6 +126,7 @@ int dsi_calc_clk_rate_6g(struct msm_dsi_host *msm_host, bool is_bonded_dsi);
+ void msm_dsi_host_snapshot(struct msm_disp_state *disp_state, struct mipi_dsi_host *host);
+ void msm_dsi_host_test_pattern_en(struct mipi_dsi_host *host);
+ struct drm_dsc_config *msm_dsi_host_get_dsc_config(struct mipi_dsi_host *host);
++unsigned int msm_dsi_host_get_bpc(struct mipi_dsi_host *host);
+ bool msm_dsi_host_is_wide_bus_enabled(struct mipi_dsi_host *host);
+ 
+ /* dsi phy */
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_host.c b/drivers/gpu/drm/msm/dsi/dsi_host.c
+index d92659d..fcf0dc5 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -3,12 +3,14 @@
+  * Copyright (c) 2015, The Linux Foundation. All rights reserved.
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/err.h>
+ #include <linux/interrupt.h>
+ #include <linux/mfd/syscon.h>
++#include <linux/moduleparam.h>
+ #include <linux/of.h>
+ #include <linux/of_graph.h>
+ #include <linux/of_irq.h>
+@@ -28,6 +30,7 @@
+ #include "sfpb.xml.h"
+ #include "dsi_cfg.h"
+ #include "msm_dsc_helper.h"
++#include "msm_atomic_trace.h"
+ #include "msm_kms.h"
+ #include "msm_gem.h"
+ #include "phy/dsi_phy.h"
+@@ -1599,7 +1602,7 @@ static void dsi_ack_err_status(struct msm_dsi_host *msm_host)
+ 	}
+ }
+ 
+-static void dsi_timeout_status(struct msm_dsi_host *msm_host)
++static u32 dsi_timeout_status(struct msm_dsi_host *msm_host)
+ {
+ 	u32 status;
+ 
+@@ -1609,6 +1612,8 @@ static void dsi_timeout_status(struct msm_dsi_host *msm_host)
+ 		dsi_write(msm_host, REG_DSI_TIMEOUT_STATUS, status);
+ 		msm_host->err_work_state |= DSI_ERR_STATE_TIMEOUT;
+ 	}
++
++	return status;
+ }
+ 
+ static void dsi_dln0_phy_err(struct msm_dsi_host *msm_host)
+@@ -1627,7 +1632,7 @@ static void dsi_dln0_phy_err(struct msm_dsi_host *msm_host)
+ 	}
+ }
+ 
+-static void dsi_fifo_status(struct msm_dsi_host *msm_host)
++static u32 dsi_fifo_status(struct msm_dsi_host *msm_host)
+ {
+ 	u32 status;
+ 
+@@ -1641,6 +1646,8 @@ static void dsi_fifo_status(struct msm_dsi_host *msm_host)
+ 			msm_host->err_work_state |=
+ 					DSI_ERR_STATE_MDP_FIFO_UNDERFLOW;
+ 	}
++
++	return status;
+ }
+ 
+ static void dsi_status(struct msm_dsi_host *msm_host)
+@@ -1670,16 +1677,21 @@ static void dsi_clk_status(struct msm_dsi_host *msm_host)
+ 
+ static void dsi_error(struct msm_dsi_host *msm_host)
+ {
++	u32 fifo, timeout;
++
+ 	/* disable dsi error interrupt */
+ 	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_ERROR, 0);
+ 
+ 	dsi_clk_status(msm_host);
+-	dsi_fifo_status(msm_host);
++	fifo = dsi_fifo_status(msm_host);
+ 	dsi_ack_err_status(msm_host);
+-	dsi_timeout_status(msm_host);
++	timeout = dsi_timeout_status(msm_host);
+ 	dsi_status(msm_host);
+ 	dsi_dln0_phy_err(msm_host);
+ 
++	if (trace_msm_dsi_link_error_enabled())
++		trace_msm_dsi_link_error(msm_host->id, fifo, timeout,
++					 dsi_read(msm_host, REG_DSI_HS_TIMER_CTRL));
+ 	queue_work(msm_host->workqueue, &msm_host->err_work);
+ }
+ 
+@@ -1698,6 +1710,9 @@ static irqreturn_t dsi_host_irq(int irq, void *ptr)
+ 	spin_unlock_irqrestore(&msm_host->intr_lock, flags);
+ 
+ 	DBG("isr=0x%x, id=%d", isr, msm_host->id);
++	if (isr & (DSI_IRQ_VIDEO_DONE | DSI_IRQ_CMD_DMA_DONE))
++		trace_msm_dsi_transfer_done(msm_host->id, isr & DSI_IRQ_VIDEO_DONE,
++					    isr & DSI_IRQ_CMD_DMA_DONE);
+ 
+ 	if (isr & DSI_IRQ_ERROR)
+ 		dsi_error(msm_host);
+@@ -2601,6 +2616,67 @@ int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
+ 	return 0;
+ }
+ 
++bool msm_dsi_host_live_total(struct mipi_dsi_host *host,
++			    const struct drm_display_mode *mode, u32 *total)
++{
++	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
++	int width, old_total, horizontal, vertical;
++	u32 active, value;
++
++	if (!msm_host->power_on || !msm_host->enabled || !msm_host->mode ||
++	    !msm_host->dsc || msm_host->lanes != 4 ||
++	    !(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO) ||
++	    !(dsi_read(msm_host, REG_DSI_CTRL) & DSI_CTRL_VID_MODE_EN))
++		return false;
++
++	if (mode->htotal % 2 || msm_host->mode->htotal % 2)
++		return false;
++
++	active = dsi_read(msm_host, REG_DSI_ACTIVE_H);
++	width = (int)FIELD_GET(DSI_ACTIVE_H_END__MASK, active) -
++		(int)FIELD_GET(DSI_ACTIVE_H_START__MASK, active);
++	if (width <= 0)
++		return false;
++	old_total = (msm_host->mode->htotal - msm_host->mode->hdisplay) / 2 + width - 1;
++	horizontal = (mode->htotal - mode->hdisplay) / 2 + width - 1;
++	vertical = mode->vtotal - 1;
++	value = dsi_read(msm_host, REG_DSI_TOTAL);
++	if (old_total != FIELD_GET(DSI_TOTAL_H_TOTAL__MASK, value) ||
++	    msm_host->mode->vtotal - 1 != FIELD_GET(DSI_TOTAL_V_TOTAL__MASK, value) ||
++	    horizontal <= 0 || horizontal > FIELD_MAX(DSI_TOTAL_H_TOTAL__MASK) ||
++	    vertical <= 0 || vertical > FIELD_MAX(DSI_TOTAL_V_TOTAL__MASK))
++		return false;
++
++	*total = (value & ~(DSI_TOTAL_H_TOTAL__MASK | DSI_TOTAL_V_TOTAL__MASK)) |
++		 DSI_TOTAL_H_TOTAL(horizontal) | DSI_TOTAL_V_TOTAL(vertical);
++	return true;
++}
++
++void msm_dsi_host_apply_live_total(struct mipi_dsi_host *host,
++				  const struct drm_display_mode *mode, u32 total)
++{
++	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
++	u32 active_h = dsi_read(msm_host, REG_DSI_ACTIVE_H);
++	u32 active_v = dsi_read(msm_host, REG_DSI_ACTIVE_V);
++	u32 hsync = dsi_read(msm_host, REG_DSI_ACTIVE_HSYNC);
++	u32 vsync_hpos = dsi_read(msm_host, REG_DSI_ACTIVE_VSYNC_HPOS);
++	u32 vsync_vpos = dsi_read(msm_host, REG_DSI_ACTIVE_VSYNC_VPOS);
++
++	dsi_write(msm_host, REG_DSI_TIMING_DB_MODE, DSI_TIMING_DB_MODE_ENABLE);
++	wmb();
++	dsi_write(msm_host, REG_DSI_ACTIVE_H, active_h);
++	dsi_write(msm_host, REG_DSI_ACTIVE_V, active_v);
++	dsi_write(msm_host, REG_DSI_TOTAL, total);
++	dsi_write(msm_host, REG_DSI_ACTIVE_HSYNC, hsync);
++	dsi_write(msm_host, REG_DSI_ACTIVE_VSYNC_HPOS, vsync_hpos);
++	dsi_write(msm_host, REG_DSI_ACTIVE_VSYNC_VPOS, vsync_vpos);
++	wmb();
++	dsi_write(msm_host, REG_DSI_TIMING_FLUSH, DSI_TIMING_FLUSH_REQUEST);
++	DBG("live video timing: active_h=%#x active_v=%#x total=%#x",
++	    active_h, active_v, total);
++	drm_mode_copy(msm_host->mode, mode);
++}
++
+ enum drm_mode_status msm_dsi_host_check_dsc(struct mipi_dsi_host *host,
+ 					    const struct drm_display_mode *mode)
+ {
+@@ -2711,3 +2787,22 @@ struct drm_dsc_config *msm_dsi_host_get_dsc_config(struct mipi_dsi_host *host)
+ 
+ 	return msm_host->dsc;
+ }
++
++unsigned int msm_dsi_host_get_bpc(struct mipi_dsi_host *host)
++{
++	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
++
++	switch (msm_host->format) {
++	case MIPI_DSI_FMT_RGB101010:
++		return 10;
++	case MIPI_DSI_FMT_RGB888:
++		return 8;
++	case MIPI_DSI_FMT_RGB666:
++	case MIPI_DSI_FMT_RGB666_PACKED:
++		return 6;
++	case MIPI_DSI_FMT_RGB565:
++		break;
++	}
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_manager.c b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+index 959daa8..37dbb15 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_manager.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+@@ -3,7 +3,14 @@
+  * Copyright (c) 2015, The Linux Foundation. All rights reserved.
+  */
+ 
+-#include "drm/drm_bridge_connector.h"
++#include <linux/moduleparam.h>
++#include <linux/of_graph.h>
++
++#include <drm/drm_atomic.h>
++#include <drm/drm_bridge_connector.h>
++#include <drm/drm_mipi_dsi.h>
++#include <drm/drm_panel.h>
++#include <drm/drm_vblank.h>
+ 
+ #include "msm_kms.h"
+ #include "dsi.h"
+@@ -457,7 +464,183 @@ static const struct drm_bridge_funcs dsi_mgr_bridge_funcs = {
+ 	.mode_valid = dsi_mgr_bridge_mode_valid,
+ };
+ 
+-/* initialize bridge */
++static bool spinel_seamless;
++module_param(spinel_seamless, bool, 0644);
++MODULE_PARM_DESC(spinel_seamless, "Experimental live 30/60/120/144 Hz modeset on the Spinel panel");
++
++static bool spinel_stock_mode(const struct drm_display_mode *mode)
++{
++	if (mode->hdisplay != 2944 || mode->vdisplay != 1840)
++		return false;
++
++	switch (drm_mode_vrefresh(mode)) {
++	case 30:
++		return mode->htotal == 3490 && mode->vtotal == 8200 && mode->clock == 858540;
++	case 60:
++		return mode->htotal == 3490 && mode->vtotal == 4100 && mode->clock == 858540;
++	case 120:
++		return mode->htotal == 3490 && mode->vtotal == 2050 && mode->clock == 858540;
++	case 144:
++		return mode->htotal == 3234 && mode->vtotal == 2050 &&
++		       mode->clock == 3234 * 2050 * 144 / 1000;
++	default:
++		return false;
++	}
++}
++
++static bool spinel_live_modes(const struct drm_display_mode *old,
++			      const struct drm_display_mode *new)
++{
++	struct drm_display_mode normalized;
++
++	if (!spinel_stock_mode(old) || !spinel_stock_mode(new) ||
++	    drm_mode_vrefresh(old) == drm_mode_vrefresh(new))
++		return false;
++
++	if (old->hsync_start - old->htotal != new->hsync_start - new->htotal ||
++	    old->hsync_end - old->htotal != new->hsync_end - new->htotal ||
++	    old->vsync_start - old->vtotal != new->vsync_start - new->vtotal ||
++	    old->vsync_end - old->vtotal != new->vsync_end - new->vtotal)
++		return false;
++	drm_mode_init(&normalized, new);
++	normalized.clock = old->clock;
++	normalized.hsync_start = old->hsync_start;
++	normalized.hsync_end = old->hsync_end;
++	normalized.htotal = old->htotal;
++	normalized.vsync_start = old->vsync_start;
++	normalized.vsync_end = old->vsync_end;
++	normalized.vtotal = old->vtotal;
++	return drm_mode_equal(old, &normalized);
++}
++
++static struct drm_panel *spinel_live_panel(struct drm_encoder *encoder)
++{
++	struct drm_bridge *bridge;
++	struct drm_panel *panel;
++	struct device_node *node;
++	struct msm_dsi *dsi;
++	int id;
++
++	bridge = drm_bridge_chain_get_first_bridge(encoder);
++	if (!bridge)
++		return NULL;
++	id = bridge->funcs == &dsi_mgr_bridge_funcs ? dsi_mgr_bridge_get_id(bridge) : -1;
++	drm_bridge_put(bridge);
++	if (id < 0 || !IS_MASTER_DSI_LINK(id)) {
++		drm_info(encoder->dev, "spinel: live switch skipped: no master DSI bridge\n");
++		return NULL;
++	}
++
++	dsi = dsi_mgr_get_dsi(id);
++	if (!dsi)
++		return NULL;
++	node = of_graph_get_remote_node(dsi->pdev->dev.of_node, 1, 0);
++	if (!node) {
++		drm_info(encoder->dev, "spinel: live switch skipped: no panel endpoint\n");
++		return NULL;
++	}
++	panel = of_device_is_compatible(node, "lenovo,spinel-display") ?
++		of_drm_find_panel(node) : ERR_PTR(-ENODEV);
++	of_node_put(node);
++	if (IS_ERR(panel) || !panel->prepared || !panel->funcs ||
++	    !panel->funcs->set_live_refresh) {
++		if (!IS_ERR(panel))
++			drm_panel_put(panel);
++		drm_info(encoder->dev, "spinel: live switch skipped: panel callback unavailable\n");
++		return NULL;
++	}
++	return panel;
++}
++
++static bool spinel_live_commit(struct drm_encoder *encoder,
++			       struct drm_crtc_state *crtc_state)
++{
++	struct msm_drm_private *priv = encoder->dev->dev_private;
++	struct msm_kms *kms = priv->kms;
++	struct msm_dsi *master = dsi_mgr_get_dsi(DSI_CLOCK_MASTER);
++	struct msm_dsi *slave = dsi_mgr_get_dsi(DSI_CLOCK_SLAVE);
++	const struct drm_display_mode *mode = &crtc_state->adjusted_mode;
++	struct drm_panel *panel;
++	u32 total_master, total_slave;
++	int ret;
++
++	if (!IS_BONDED_DSI() || !master || !slave ||
++	    !kms->funcs->stage_live_timing || !kms->funcs->flush_live_timing)
++		return false;
++
++	panel = spinel_live_panel(encoder);
++	if (!panel)
++		return false;
++
++	if (!msm_dsi_host_live_total(master->host, mode, &total_master) ||
++	    !msm_dsi_host_live_total(slave->host, mode, &total_slave)) {
++		drm_info(encoder->dev, "spinel: live switch skipped: DSI host timing mismatch\n");
++		goto put_panel;
++	}
++
++	if (drm_crtc_wait_one_vblank(crtc_state->crtc) ||
++	    !kms->funcs->stage_live_timing(encoder, mode)) {
++		drm_info(encoder->dev, "spinel: live switch skipped: DPU timing or vblank unavailable\n");
++		goto put_panel;
++	}
++	msm_dsi_host_apply_live_total(master->host, mode, total_master);
++	msm_dsi_host_apply_live_total(slave->host, mode, total_slave);
++
++	ret = panel->funcs->set_live_refresh(panel, drm_mode_vrefresh(mode));
++	if (ret) {
++		drm_warn(encoder->dev,
++			 "spinel: live refresh command failed (%d), falling back to full modeset\n", ret);
++		goto put_panel;
++	}
++	drm_info(encoder->dev, "spinel: live DPU and DSI timings staged at %d Hz\n",
++		 drm_mode_vrefresh(mode));
++	drm_panel_put(panel);
++	return true;
++
++put_panel:
++	drm_panel_put(panel);
++	return false;
++}
++
++unsigned int msm_dsi_try_live_modeset(struct drm_atomic_commit *state)
++{
++	struct drm_crtc_state *old_crtc, *new_crtc;
++	struct drm_encoder *encoder;
++	struct drm_crtc *crtc;
++	unsigned int live_encoders = 0;
++	int i;
++
++	if (!READ_ONCE(spinel_seamless))
++		return 0;
++
++	for_each_oldnew_crtc_in_state(state, crtc, old_crtc, new_crtc, i) {
++		if (!spinel_live_modes(&old_crtc->mode, &new_crtc->mode))
++			continue;
++		if (!old_crtc->active || !new_crtc->active || !new_crtc->mode_changed ||
++		    new_crtc->active_changed || new_crtc->connectors_changed ||
++		    new_crtc->connector_mask != old_crtc->connector_mask ||
++		    new_crtc->encoder_mask != old_crtc->encoder_mask ||
++		    hweight32(new_crtc->encoder_mask) != 1 ||
++		    new_crtc->ctm != old_crtc->ctm ||
++		    !spinel_live_modes(&old_crtc->adjusted_mode, &new_crtc->adjusted_mode)) {
++			drm_info(state->dev,
++				 "spinel: live switch skipped: atomic state active %d/%d, changed=%d/%d/%d, encoders=%#x/%#x, connectors=%#x/%#x\n",
++				 old_crtc->active, new_crtc->active, new_crtc->mode_changed,
++				 new_crtc->active_changed, new_crtc->connectors_changed,
++				 old_crtc->encoder_mask, new_crtc->encoder_mask,
++				 old_crtc->connector_mask, new_crtc->connector_mask);
++			continue;
++		}
++		drm_for_each_encoder_mask(encoder, state->dev, new_crtc->encoder_mask) {
++			if (spinel_live_commit(encoder, new_crtc)) {
++				new_crtc->mode_changed = false;
++				live_encoders |= drm_encoder_mask(encoder);
++			}
++		}
++	}
++	return live_encoders;
++}
++
+ int msm_dsi_manager_connector_init(struct msm_dsi *msm_dsi,
+ 				   struct drm_encoder *encoder)
+ {
+@@ -465,6 +648,7 @@ int msm_dsi_manager_connector_init(struct msm_dsi *msm_dsi,
+ 	struct drm_bridge *bridge;
+ 	struct dsi_bridge *dsi_bridge;
+ 	struct drm_connector *connector;
++	unsigned int bpc;
+ 	int ret;
+ 
+ 	dsi_bridge = devm_drm_bridge_alloc(msm_dsi->dev->dev, struct dsi_bridge, base,
+@@ -490,6 +674,10 @@ int msm_dsi_manager_connector_init(struct msm_dsi *msm_dsi,
+ 		return PTR_ERR(connector);
+ 	}
+ 
++	bpc = msm_dsi_host_get_bpc(msm_dsi->host);
++	if (bpc)
++		connector->display_info.bpc = bpc;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+index 5d805a7..3879894 100644
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+@@ -886,8 +886,8 @@ static int dsi_pll_7nm_init(struct msm_dsi_phy *phy)
+ 
+ 	phy->vco_hw = &pll_7nm->clk_hw;
+ 
+-	/* TODO: Remove this when we have proper display handover support */
+-	msm_dsi_phy_pll_save_state(phy);
++	if (dsi_pll_7nm_lock_status(pll_7nm) == 0)
++		msm_dsi_phy_pll_save_state(phy);
+ 	/*
+ 	 * Store also proper vco_current_rate, because its value will be used in
+ 	 * dsi_7nm_pll_restore_state().
+diff --git a/drivers/gpu/drm/msm/msm_atomic.c b/drivers/gpu/drm/msm/msm_atomic.c
+index a8babf1..244b871 100644
+--- a/drivers/gpu/drm/msm/msm_atomic.c
++++ b/drivers/gpu/drm/msm/msm_atomic.c
+@@ -216,7 +216,9 @@ void msm_atomic_commit_tail(struct drm_atomic_commit *state)
+ 	struct msm_drm_private *priv = dev->dev_private;
+ 	struct msm_kms *kms = priv->kms;
+ 	struct drm_crtc *async_crtc = NULL;
++	struct drm_encoder *encoder;
+ 	unsigned crtc_mask = get_crtc_mask(state);
++	unsigned int live_encoders = 0;
+ 	bool async = can_do_async(state, &async_crtc);
+ 
+ 	trace_msm_atomic_commit_tail_start(async, crtc_mask);
+@@ -241,6 +243,9 @@ void msm_atomic_commit_tail(struct drm_atomic_commit *state)
+ 	if (kms->funcs->prepare_commit)
+ 		kms->funcs->prepare_commit(kms, state);
+ 
++	if (!async)
++		live_encoders = msm_dsi_try_live_modeset(state);
++
+ 	/*
+ 	 * Push atomic updates down to hardware:
+ 	 */
+@@ -248,6 +253,12 @@ void msm_atomic_commit_tail(struct drm_atomic_commit *state)
+ 	drm_atomic_helper_commit_planes(dev, state, 0);
+ 	drm_atomic_helper_commit_modeset_enables(dev, state);
+ 
++	/* atomic_begin clears the previous CTL pending flush mask. */
++	if (live_encoders && kms->funcs->flush_live_timing) {
++		drm_for_each_encoder_mask(encoder, dev, live_encoders)
++			kms->funcs->flush_live_timing(encoder);
++	}
++
+ 	if (async) {
+ 		struct msm_pending_timer *timer =
+ 			&kms->pending_timers[drm_crtc_index(async_crtc)];
+diff --git a/drivers/gpu/drm/msm/msm_atomic_trace.h b/drivers/gpu/drm/msm/msm_atomic_trace.h
+index b4ca0ed..6efd564 100644
+--- a/drivers/gpu/drm/msm/msm_atomic_trace.h
++++ b/drivers/gpu/drm/msm/msm_atomic_trace.h
+@@ -103,6 +103,42 @@ TRACE_EVENT(msm_atomic_flush_commit,
+ 		    __entry->crtc_mask)
+ );
+ 
++TRACE_EVENT(msm_dsi_transfer_done,
++	    TP_PROTO(int link, bool video, bool dma),
++	    TP_ARGS(link, video, dma),
++	    TP_STRUCT__entry(
++		    __field(int, link)
++		    __field(bool, video)
++		    __field(bool, dma)
++		    ),
++	    TP_fast_assign(
++		    __entry->link = link;
++		    __entry->video = video;
++		    __entry->dma = dma;
++		    ),
++	    TP_printk("link=%d video_done=%d dma_done=%d", __entry->link,
++		      __entry->video, __entry->dma)
++);
++
++TRACE_EVENT(msm_dsi_link_error,
++	    TP_PROTO(int link, u32 fifo, u32 timeout, u32 hs_timer),
++	    TP_ARGS(link, fifo, timeout, hs_timer),
++	    TP_STRUCT__entry(
++		    __field(int, link)
++		    __field(u32, fifo)
++		    __field(u32, timeout)
++		    __field(u32, hs_timer)
++		    ),
++	    TP_fast_assign(
++		    __entry->link = link;
++		    __entry->fifo = fifo;
++		    __entry->timeout = timeout;
++		    __entry->hs_timer = hs_timer;
++		    ),
++	    TP_printk("link=%d fifo=%#x timeout=%#x hs_timer=%#x", __entry->link,
++		      __entry->fifo, __entry->timeout, __entry->hs_timer)
++);
++
+ #endif
+ 
+ #undef TRACE_INCLUDE_PATH
+diff --git a/drivers/gpu/drm/msm/msm_drv.h b/drivers/gpu/drm/msm/msm_drv.h
+index eb4bbae..e4d1dac 100644
+--- a/drivers/gpu/drm/msm/msm_drv.h
++++ b/drivers/gpu/drm/msm/msm_drv.h
+@@ -289,7 +289,10 @@ static inline void __exit msm_hdmi_unregister(void) {}
+ #endif
+ 
+ struct msm_dsi;
++struct drm_atomic_state;
++
+ #ifdef CONFIG_DRM_MSM_DSI
++unsigned int msm_dsi_try_live_modeset(struct drm_atomic_commit *state);
+ int dsi_dev_attach(struct platform_device *pdev);
+ void dsi_dev_detach(struct platform_device *pdev);
+ void __init msm_dsi_register(void);
+@@ -304,6 +307,11 @@ bool msm_dsi_wide_bus_enabled(struct msm_dsi *msm_dsi);
+ struct drm_dsc_config *msm_dsi_get_dsc_config(struct msm_dsi *msm_dsi);
+ const char *msm_dsi_get_te_source(struct msm_dsi *msm_dsi);
+ #else
++static inline unsigned int msm_dsi_try_live_modeset(struct drm_atomic_commit *state)
++{
++	return 0;
++}
++
+ static inline void __init msm_dsi_register(void)
+ {
+ }
+diff --git a/drivers/gpu/drm/msm/msm_kms.c b/drivers/gpu/drm/msm/msm_kms.c
+index e5d0ea6..83c0d22 100644
+--- a/drivers/gpu/drm/msm/msm_kms.c
++++ b/drivers/gpu/drm/msm/msm_kms.c
+@@ -384,5 +384,10 @@ void msm_drm_kms_post_init(struct device *dev)
+ 	struct drm_device *ddev = priv->dev;
+ 
+ 	drm_kms_helper_poll_init(ddev);
+-	drm_client_setup(ddev, NULL);
++
++	if (ddev->driver->fbdev_probe)
++		drm_client_setup(ddev, NULL);
++	else
++		drm_dbg_kms(ddev,
++			    "no fbdev_probe, skipping in-kernel DRM client setup\n");
+ }
+diff --git a/drivers/gpu/drm/msm/msm_kms.h b/drivers/gpu/drm/msm/msm_kms.h
+index f25b31e..a7b5a1e 100644
+--- a/drivers/gpu/drm/msm/msm_kms.h
++++ b/drivers/gpu/drm/msm/msm_kms.h
+@@ -74,6 +74,10 @@ struct msm_kms_funcs {
+ 	 */
+ 	void (*prepare_commit)(struct msm_kms *kms, struct drm_atomic_commit *state);
+ 
++	bool (*stage_live_timing)(struct drm_encoder *encoder,
++				  const struct drm_display_mode *mode);
++	void (*flush_live_timing)(struct drm_encoder *encoder);
++
+ 	/**
+ 	 * Flush an atomic commit.  This is called after the hardware
+ 	 * updates have already been pushed down to effected planes/
+diff --git a/drivers/gpu/drm/msm/registers/display/dsi.xml b/drivers/gpu/drm/msm/registers/display/dsi.xml
+index e40125f..b4125ad 100644
+--- a/drivers/gpu/drm/msm/registers/display/dsi.xml
++++ b/drivers/gpu/drm/msm/registers/display/dsi.xml
+@@ -362,6 +362,13 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
+ 		<bitfield name="COUNT" low="16" high="23" type="uint"/>
+ 		<bitfield name="CLR" pos="0" type="boolean"/>
+ 	</reg32>
++	<!-- DSI6G adds four bytes to these offsets at runtime. -->
++	<reg32 offset="0x001e0" name="TIMING_FLUSH">
++		<bitfield name="REQUEST" pos="0" type="boolean"/>
++	</reg32>
++	<reg32 offset="0x001e4" name="TIMING_DB_MODE">
++		<bitfield name="ENABLE" pos="0" type="boolean"/>
++	</reg32>
+ 	<reg32 offset="0x001f0" name="VERSION">
+ 		<bitfield name="MAJOR" low="24" high="31" type="uint"/>
+ 	</reg32>
+diff --git a/include/drm/drm_panel.h b/include/drm/drm_panel.h
+index b873234..1fe1bb2 100644
+--- a/include/drm/drm_panel.h
++++ b/include/drm/drm_panel.h
+@@ -144,6 +144,14 @@ struct drm_panel_funcs {
+ 	 * Allows panels to create panels-specific debugfs files.
+ 	 */
+ 	void (*debugfs_init)(struct drm_panel *panel, struct dentry *root);
++
++	/**
++	 * @set_live_refresh:
++	 *
++	 * Notify a prepared panel of an active timing change in Hz.
++	 * Optional and used only by drivers which negotiate live changes.
++	 */
++	int (*set_live_refresh)(struct drm_panel *panel, u16 fps);
+ };
+ 
+ struct drm_panel_follower_funcs {
